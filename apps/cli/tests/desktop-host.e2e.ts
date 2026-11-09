@@ -8,7 +8,57 @@ import { fileURLToPath } from 'node:url'
 import { finished } from 'node:stream/promises'
 import { expect, it, onTestFinished } from 'vitest'
 
-it.each([false, true])('settles startup after parent IPC disconnect (boot failure: %s)', async (fail) => {
+/**
+ * How the stubbed profile boot settles when Electron disconnects.
+ *
+ * - `clean`: resolves a live application whose shutdown records completion.
+ * - `boot-failure`: rejects, exercising the startup diagnostic path.
+ * - `disposed`: resolves a context that shutdown already disposed, the race that
+ *   previously threw INACTIVE_EFFECT while installing operation diagnostics.
+ */
+type DisconnectScenario = 'clean' | 'boot-failure' | 'disposed'
+
+function profileBootSource(scenario: DisconnectScenario, root: string): string {
+  const shutdown = `{ shutdown: async () => writeFileSync(${JSON.stringify(join(root, 'stopped'))}, 'stopped') }`
+  if (scenario === 'boot-failure') {
+    return `
+      export function runProfile(options) {
+        process.send({ type: 'booting', packageManager: options.packageManager });
+        return new Promise((resolve, reject) => process.once('disconnect', () => {
+          reject(new Error('fixture boot failure'));
+        }));
+      }
+    `
+  }
+  if (scenario === 'disposed') {
+    return `
+      import { writeFileSync } from 'node:fs';
+      import { Context } from '@deepseek-ai/cordis';
+      export function runProfile(options) {
+        const root = new Context();
+        const fiber = root.plugin(() => {});
+        process.send({ type: 'booting', packageManager: options.packageManager });
+        return new Promise((resolve) => process.once('disconnect', async () => {
+          await fiber.dispose();
+          resolve({ ctx: fiber.ctx, shutdown: ${shutdown} });
+        }));
+      }
+    `
+  }
+  return `
+    import { writeFileSync } from 'node:fs';
+    export function runProfile(options) {
+      process.send({ type: 'booting', packageManager: options.packageManager });
+      return new Promise((resolve, reject) => process.once('disconnect', () => {
+        resolve({ ctx: { plugin: async () => {}, effect: () => {}, on: () => {}, inject: () => {},
+          connection: { authenticatedUrl: value => value }, webServer: { port: 19387 } },
+          shutdown: ${shutdown} });
+      }));
+    }
+  `
+}
+
+async function runDisconnectScenario(scenario: DisconnectScenario): Promise<void> {
   const root = mkdtempSync(join(tmpdir(), 'desktop-disconnect-'))
   const modules = join(root, 'node_modules', '@deepseek-ai')
   const hostDirectory = fileURLToPath(new URL('../../desktop-host/', import.meta.url))
@@ -35,18 +85,7 @@ it.each([false, true])('settles startup after parent IPC disconnect (boot failur
     export const loadLayeredEnv = () => ({});
   `)
   writeFileSync(join(modules, 'dsh', 'package.json'), '{"type":"module","exports":{"./profile-boot":"./profile-boot.js"}}')
-  writeFileSync(join(modules, 'dsh', 'profile-boot.js'), `
-    import { writeFileSync } from 'node:fs';
-    export function runProfile(options) {
-      process.send({ type: 'booting', packageManager: options.packageManager });
-      return new Promise((resolve, reject) => process.once('disconnect', () => {
-        if (${String(fail)}) { reject(new Error('fixture boot failure')); return; }
-        resolve({ ctx: { plugin: async () => {}, effect: () => {}, on: () => {}, inject: () => {},
-          connection: { authenticatedUrl: value => value }, webServer: { port: 19387 } },
-          shutdown: { shutdown: async () => writeFileSync(${JSON.stringify(join(root, 'stopped'))}, 'stopped') } });
-      }));
-    }
-  `)
+  writeFileSync(join(modules, 'dsh', 'profile-boot.js'), profileBootSource(scenario, root))
   const entry = join(root, 'index.js')
   copyFileSync(join(hostDirectory, 'lib', 'index.js'), entry)
   const pnpm = join(root, 'bundled-pnpm.mjs')
@@ -81,13 +120,17 @@ it.each([false, true])('settles startup after parent IPC disconnect (boot failur
     const exitCode = await exited
     await drained
     expect(child.signalCode).toBeNull()
-    expect(exitCode, stderr).toBe(fail ? 1 : 0)
+    expect(exitCode, stderr).toBe(scenario === 'boot-failure' ? 1 : 0)
     expect(stderr).not.toContain('ERR_IPC_CHANNEL_CLOSED')
     expect(stderr).not.toContain('Unhandled')
-    if (fail) expect(stderr).toContain('fixture boot failure')
+    if (scenario === 'boot-failure') expect(stderr).toContain('fixture boot failure')
     else expect(readFileSync(join(root, 'stopped'), 'utf8')).toBe('stopped')
   } finally {
     if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
     await Promise.all([exited, drained])
   }
-})
+}
+
+it.each(['clean', 'boot-failure', 'disposed'] as const)(
+  'settles startup after parent IPC disconnect (%s)', runDisconnectScenario,
+)

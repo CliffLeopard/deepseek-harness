@@ -128,6 +128,10 @@ async function main(): Promise<void> {
   })
   process.once('disconnect', () => { void stop() })
   const { ctx } = await application
+  // A shutdown request during startup disposes the tree before this point; an
+  // effect registered on it would throw INACTIVE_EFFECT and report a startup
+  // failure for an exit the shell requested.
+  if (stopping !== undefined) return
   installOperationDiagnostics(ctx, record => send({ type: 'plugin-operation', record }), 32, runId)
   control.updateTasks = installDesktopUpdateTaskControl(ctx)
   control.quitInspection = installDesktopQuitInspection(ctx)
